@@ -1,11 +1,16 @@
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
 
+import soot.AntTask.PhaseOptbb;
 import soot.Body;
 import soot.BodyTransformer;
 import soot.Local;
 import soot.PackManager;
 import soot.PatchingChain;
+import soot.PhaseOptions;
 import soot.RefType;
 import soot.Scene;
 import soot.SootClass;
@@ -18,68 +23,46 @@ import soot.jimple.InvokeStmt;
 import soot.jimple.Jimple;
 import soot.jimple.StringConstant;
 import soot.options.Options;
+import soot.toDex.DexPrinter;
 
 
 public class AndroidInstrument {
 	
-	public void main(String[] args) {
-		
+	private static String[] stripDuplicateAndroidJarsBug(final String[] args) {
+		List<String> argList = new ArrayList<>();
+		for (int i = 0; i < args.length; i++) {
+			if ("-android-jars".equals(args[i])) {
+				i++;
+			}
+			else {
+				argList.add(args[i]);
+			}
+		}
+		return argList.toArray(new String[argList.size()]);
+	}
+	
+	public static void main(String[] args) {
 		//prefer Android APK files// -src-prec apk
 		Options.v().set_src_prec(Options.src_prec_apk);
-		
 		//output as APK, too//-f J
 		Options.v().set_output_format(Options.output_format_dex);
-		
-        // resolve the PrintStream and System soot-classes
-		Scene.v().addBasicClass("java.io.PrintStream",SootClass.SIGNATURES);
-        Scene.v().addBasicClass("java.lang.System",SootClass.SIGNATURES);
+		Options.v().parse(args);
 
-        PackManager.v().getPack("jtp").add(new Transform("jtp.myInstrumenter", new BodyTransformer() {
-
-			@Override
-			protected void internalTransform(final Body b, String phaseName, @SuppressWarnings("rawtypes") Map options) {
-				final PatchingChain<Unit> units = b.getUnits();
-				
-				//important to use snapshotIterator here
-				for(Iterator<Unit> iter = units.snapshotIterator(); iter.hasNext();) {
-					final Unit u = iter.next();
-					u.apply(new AbstractStmtSwitch() {
-						
-						public void caseInvokeStmt(InvokeStmt stmt) {
-							InvokeExpr invokeExpr = stmt.getInvokeExpr();
-							if(invokeExpr.getMethod().getName().equals("onDraw")) {
-
-								Local tmpRef = addTmpRef(b);
-								Local tmpString = addTmpString(b);
-								
-								  // insert "tmpRef = java.lang.System.out;" 
-						        units.insertBefore(Jimple.v().newAssignStmt( 
-						                      tmpRef, Jimple.v().newStaticFieldRef( 
-						                      Scene.v().getField("<java.lang.System: java.io.PrintStream out>").makeRef())), u);
-
-						        // insert "tmpLong = 'HELLO';" 
-						        units.insertBefore(Jimple.v().newAssignStmt(tmpString, 
-						                      StringConstant.v("HELLO")), u);
-						        
-						        // insert "tmpRef.println(tmpString);" 
-						        SootMethod toCall = Scene.v().getSootClass("java.io.PrintStream").getMethod("void println(java.lang.String)");                    
-						        units.insertBefore(Jimple.v().newInvokeStmt(
-						                      Jimple.v().newVirtualInvokeExpr(tmpRef, toCall.makeRef(), tmpString)), u);
-						        
-						        //check that we did not mess up the Jimple
-						        b.validate();
-							}
-						}
-						
-					});
+        SootClass c = Scene.v().forceResolve("br.com.lealdn.client.ClientMain", SootClass.BODIES);
+        c.setApplicationClass();
+        Scene.v().loadNecessaryClasses();
+        
+		for (final SootClass clazz : Scene.v().getClasses()) {
+			for (final SootMethod method : clazz.getMethods()) {
+				if (SootUtils.isAnnotated(method)) {
+					SootUtils.modifyMethodToOffload(method);
 				}
 			}
-
-
-		}));
+		}
 		
-		soot.Main.main(args);
+		PackManager.v().writeOutput();
 	}
+	
 
     private static Local addTmpRef(Body body)
     {
