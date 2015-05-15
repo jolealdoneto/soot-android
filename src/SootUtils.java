@@ -19,6 +19,7 @@ import soot.IntType;
 import soot.Local;
 import soot.LongType;
 import soot.Modifier;
+import soot.PatchingChain;
 import soot.RefLikeType;
 import soot.RefType;
 import soot.Scene;
@@ -31,6 +32,7 @@ import soot.Value;
 import soot.VoidType;
 import soot.jimple.AssignStmt;
 import soot.jimple.IntConstant;
+import soot.jimple.InvokeExpr;
 import soot.jimple.InvokeStmt;
 import soot.jimple.Jimple;
 import soot.jimple.JimpleBody;
@@ -55,11 +57,15 @@ public class SootUtils {
         System.out.println(staticFields);
         turnFieldsPublic(staticFields);
         
-        Unit cursor = body.getUnits().getPredOf(((JimpleBody)body).getFirstNonIdentityStmt());
+        final SootMethod copyMethod = copyMethod(method);
+        Unit cursor = stripAllUnitsFromMethod(body);
+        cursor = body.getUnits().getLast();
+        final Unit noop = Jimple.v().newNopStmt();
+        body.getUnits().add(noop);
+
         final Map<String, Object> mapResult = addMapToBody(body, cursor);
         final Local mapLocal = (Local)mapResult.get("mapLocal");
         final Local startTimeLocal = createStartTimeLocal(body);
-        final List<Unit> endStmts = getAllEndStmtFromMethod(body);
         cursor = (Unit)mapResult.get("cursor");
         
         for (final SootField f : staticFields) {
@@ -70,23 +76,106 @@ public class SootUtils {
         cursor = addArgsRefToMap(mapLocal, body, method, cursor);
         cursor = invokeConditionToOffloadIfNecessary(method, mapLocal, startTimeLocal, body, cursor);
         cursor = invokeInterceptorWithNeededLocals(method, mapLocal, body, cursor);
-        addCallsToInstrumentingMethod(method, body, endStmts, startTimeLocal, mapLocal);
+        addCallsToInstrumentingMethod(method, body, cursor, copyMethod, startTimeLocal, mapLocal);
+        
+        body.getUnits().remove(noop);
+        
+        System.out.println(body);
     }
     
-    private static void addCallsToInstrumentingMethod(final SootMethod method, final Body body, final List<Unit> endStmts, final Local startTimeLocal, final Local mapLocal) {
+    private static Unit stripAllUnitsFromMethod(final Body body) {
+    	final JimpleBody jbody = (JimpleBody)body;
+    	List<Value> paramRefs = jbody.getParameterRefs();
+    	List<Unit> unitsToRemove = new ArrayList<Unit>();
+    	Unit suc = jbody.getFirstNonIdentityStmt();
+    	Unit last = suc;
+    	while(suc != null) {
+    		if (!paramRefs.contains(suc)) {
+    			unitsToRemove.add(suc);
+    		}
+    		suc = body.getUnits().getSuccOf(suc);
+    	}
+    	
+    	for (Unit toRemove : unitsToRemove) {
+    		body.getUnits().remove(toRemove);
+    	}
+    	
+    	return last;
+    }
+    
+    private static SootMethod copyMethod(final SootMethod method) {
+    	final SootMethod copy = new SootMethod("$offloadCopy_" + method.getName(), method.getParameterTypes(), method.getReturnType(), method.getModifiers());
+    	final JimpleBody copyBody = Jimple.v().newBody(copy);
+    	copy.setActiveBody(copyBody);
+    	final Body methodBody = method.retrieveActiveBody();
+    	method.getDeclaringClass().addMethod(copy);
+    	copyBody.importBodyContentsFrom(methodBody);
+
+    	for (final Unit unit : copyBody.getUnits()) {
+    		cloneUnitAndSwapMethodsIfApplies(unit, method, copy);
+    	}
+    	
+    	return copy;
+    }
+    
+    private static void cloneUnitAndSwapMethodsIfApplies(final Unit unit, final SootMethod originalMethod, final SootMethod copyMethod) {
+    	final Unit copyUnit = unit;
+
+    	if (copyUnit instanceof JAssignStmt) {
+    		final JAssignStmt assign = (JAssignStmt)copyUnit;
+    		if (assign.getRightOp() instanceof InvokeExpr) {
+    			swapMethods(assign.getInvokeExpr(), originalMethod, copyMethod);
+    		}
+    	}
+    	else if (copyUnit instanceof JInvokeStmt) {
+    		final InvokeStmt invoke = (JInvokeStmt)copyUnit;
+    		swapMethods(invoke.getInvokeExpr(), originalMethod, copyMethod);
+    	}
+    }
+    
+    private static void swapMethods(final InvokeExpr invokeExpr, final SootMethod fromMethod, final SootMethod toMethod) {
+    	if (invokeExpr != null && invokeExpr.getMethod().equals(fromMethod)) {
+    		invokeExpr.setMethodRef(toMethod.makeRef());
+    	}
+    }
+    
+    private static void addCallsToInstrumentingMethod(final SootMethod method, final Body body, final Unit cursor, final SootMethod copyMethod, final Local startTimeLocal, final Local mapLocal) {
+    	InvokeExpr invokeExpr = null;
+    	if ((copyMethod.getModifiers() & Modifier.STATIC) > 0) {
+    		invokeExpr = Jimple.v().newStaticInvokeExpr(copyMethod.makeRef(), body.getParameterLocals());
+    	}
+    	else {
+    		invokeExpr = Jimple.v().newVirtualInvokeExpr(body.getThisLocal(), copyMethod.makeRef(), body.getParameterLocals());
+    	}
+    	
+    	Unit assignOrInvoke = null;
+    	Unit retStmt = null;
+    	if (!(copyMethod.getReturnType() instanceof VoidType)) {
+    		final Local ret = Jimple.v().newLocal("$copyMethodReturnLocal", copyMethod.getReturnType());
+    		body.getLocals().add(ret);
+    		
+    		assignOrInvoke = Jimple.v().newAssignStmt(ret, invokeExpr);
+    		retStmt = Jimple.v().newReturnStmt(ret);
+    	}
+    	else {
+    		assignOrInvoke = Jimple.v().newInvokeStmt(invokeExpr);
+    		retStmt = Jimple.v().newReturnVoidStmt();
+    	}
+    	
+    	body.getUnits().add(assignOrInvoke);
+    	
     	final SootMethod instrumentingMethod = Scene.v().getMethod("<br.com.lealdn.offload.Intercept: void updateMethodRuntime(java.lang.String,long,java.util.Map)>");
         final List<Value> args = new ArrayList<>();
         args.add(StringConstant.v(method.getSignature()));
         args.add(startTimeLocal);
         args.add(mapLocal);
 
-    	for (Unit u : endStmts) {
-    		final Unit invokeInstrument = Jimple.v().newInvokeStmt(
-    			Jimple.v().newStaticInvokeExpr(instrumentingMethod.makeRef(), args)
-    		);
-    		
-    		body.getUnits().insertBefore(invokeInstrument, u);
-    	}
+        final Unit invokeInstrument = Jimple.v().newInvokeStmt(
+        	Jimple.v().newStaticInvokeExpr(instrumentingMethod.makeRef(), args)
+        );
+
+        body.getUnits().add(invokeInstrument);
+        body.getUnits().add(retStmt);
     }
     
     private static List<Unit> getAllEndStmtFromMethod(final Body body) {
