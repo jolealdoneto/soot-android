@@ -9,6 +9,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+import javax.lang.model.type.ArrayType;
+
 import soot.Body;
 import soot.BooleanType;
 import soot.ByteType;
@@ -31,6 +33,8 @@ import soot.Unit;
 import soot.Value;
 import soot.VoidType;
 import soot.jimple.AssignStmt;
+import soot.jimple.Constant;
+import soot.jimple.DoubleConstant;
 import soot.jimple.IntConstant;
 import soot.jimple.InvokeExpr;
 import soot.jimple.InvokeStmt;
@@ -75,8 +79,9 @@ public class SootUtils {
         cursor = addThisRefToMap(mapLocal, body, cursor);
         cursor = addArgsRefToMap(mapLocal, body, method, cursor);
         cursor = invokeConditionToOffloadIfNecessary(method, mapLocal, startTimeLocal, body, cursor);
-        cursor = invokeInterceptorWithNeededLocals(method, mapLocal, body, cursor);
-        addCallsToInstrumentingMethod(method, body, cursor, copyMethod, startTimeLocal, mapLocal);
+        final Unit[] cursorAndTrapStmt = invokeInterceptorWithNeededLocals(method, mapLocal, body, cursor);
+        cursor = cursorAndTrapStmt[0];
+        addCallsToInstrumentingMethod(method, body, cursor, copyMethod, startTimeLocal, mapLocal, cursorAndTrapStmt[1]);
         
         body.getUnits().remove(noop);
         
@@ -139,7 +144,7 @@ public class SootUtils {
     	}
     }
     
-    private static void addCallsToInstrumentingMethod(final SootMethod method, final Body body, final Unit cursor, final SootMethod copyMethod, final Local startTimeLocal, final Local mapLocal) {
+    private static void addCallsToInstrumentingMethod(final SootMethod method, final Body body, final Unit cursor, final SootMethod copyMethod, final Local startTimeLocal, final Local mapLocal, final Unit sendAndSerializeStmt) {
     	InvokeExpr invokeExpr = null;
     	if ((copyMethod.getModifiers() & Modifier.STATIC) > 0) {
     		invokeExpr = Jimple.v().newStaticInvokeExpr(copyMethod.makeRef(), body.getParameterLocals());
@@ -147,6 +152,8 @@ public class SootUtils {
     	else {
     		invokeExpr = Jimple.v().newVirtualInvokeExpr(body.getThisLocal(), copyMethod.makeRef(), body.getParameterLocals());
     	}
+    	
+    	final Unit lastStmt = body.getUnits().getPredOf(body.getUnits().getLast());
     	
     	Unit assignOrInvoke = null;
     	Unit retStmt = null;
@@ -162,13 +169,33 @@ public class SootUtils {
     		retStmt = Jimple.v().newReturnVoidStmt();
     	}
     	
-    	body.getUnits().add(assignOrInvoke);
+    	final SootMethod setShouldRunRTTMethod = Scene.v().getMethod("<br.com.lealdn.offload.OffloadingManager: void setShouldRunRTT(boolean)>");
     	
-    	final SootMethod instrumentingMethod = Scene.v().getMethod("<br.com.lealdn.offload.Intercept: void updateMethodRuntime(java.lang.String,long,java.util.Map)>");
+    	body.getUnits().add(Jimple.v().newInvokeStmt(
+    		Jimple.v().newStaticInvokeExpr(setShouldRunRTTMethod.makeRef(), IntConstant.v(0))
+    	));
+    	
+    	final Local rxTxCountLocal = Jimple.v().newLocal("rxTxCount", soot.ArrayType.v(LongType.v(), 1));
+    	body.getLocals().add(rxTxCountLocal);
+    	
+    	body.getUnits().add(
+    		Jimple.v().newAssignStmt(rxTxCountLocal,
+    			Jimple.v().newStaticInvokeExpr(Scene.v().getMethod("<br.com.lealdn.offload.Intercept: long[] getRxTxCount()>").makeRef())
+    		)
+        );
+    	
+    	body.getUnits().add(assignOrInvoke);
+
+    	body.getUnits().add(Jimple.v().newInvokeStmt(
+    		Jimple.v().newStaticInvokeExpr(setShouldRunRTTMethod.makeRef(), IntConstant.v(1))
+    	));
+    	
+    	final SootMethod instrumentingMethod = Scene.v().getMethod("<br.com.lealdn.offload.Intercept: void updateMethodRuntime(java.lang.String,long,java.util.Map,long[])>");
         final List<Value> args = new ArrayList<>();
         args.add(StringConstant.v(method.getSignature()));
         args.add(startTimeLocal);
         args.add(mapLocal);
+        args.add(rxTxCountLocal);
 
         final Unit invokeInstrument = Jimple.v().newInvokeStmt(
         	Jimple.v().newStaticInvokeExpr(instrumentingMethod.makeRef(), args)
@@ -176,16 +203,8 @@ public class SootUtils {
 
         body.getUnits().add(invokeInstrument);
         body.getUnits().add(retStmt);
-    }
-    
-    private static List<Unit> getAllEndStmtFromMethod(final Body body) {
-    	final List<Unit> returnStmts = new ArrayList<Unit>();
-    	for (Unit u : body.getUnits()) {
-    		if (u instanceof ReturnStmt) {
-    			returnStmts.add(u);
-    		}
-    	}
-    	return returnStmts;
+
+        body.getTraps().add(Jimple.v().newTrap(Scene.v().loadClassAndSupport("java.lang.Throwable"), sendAndSerializeStmt, lastStmt, lastStmt));
     }
     
     private static Local createStartTimeLocal(final Body body) {
@@ -327,7 +346,7 @@ public class SootUtils {
 	    return autoboxResult;
     }
 
-    public static Unit invokeInterceptorWithNeededLocals(final SootMethod method, final Local mapLocal, final Body body, Unit cursor) {
+    public static Unit[] invokeInterceptorWithNeededLocals(final SootMethod method, final Local mapLocal, final Body body, Unit cursor) {
     	final boolean hasReturn = !(method.getReturnType() instanceof VoidType);
 
     	final SootMethod sendAndSerialize = Scene.v().getMethod("<br.com.lealdn.offload.Intercept: java.lang.Object sendAndSerialize(java.lang.String,java.util.Map)>");
@@ -353,13 +372,13 @@ public class SootUtils {
 
             final ReturnStmt retStmt = Jimple.v().newReturnStmt(returnVariable);
             body.getUnits().insertAfter(retStmt,  cursorSendAndSerialize);
-            return retStmt;
+            return new Unit[] { retStmt, stmt };
         }
         else {
         	final Unit retStmt = Jimple.v().newReturnVoidStmt();
         	body.getUnits().insertAfter(retStmt, stmt);
         	
-        	return retStmt;
+        	return new Unit[] { retStmt, stmt };
         }
     }
     
